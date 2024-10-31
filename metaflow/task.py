@@ -306,8 +306,6 @@ class MetaflowTask(object):
             "origin_run_id": origin_run_id,
             "origin_task_id": origin_task_id,
         }
-        _system_logger.update_context(task_payload)
-        _system_monitor.update_context(task_payload)
 
         msg = "Cloning task from {}/{}/{}/{} to {}/{}/{}/{}".format(
             self.flow.name,
@@ -512,8 +510,7 @@ class MetaflowTask(object):
             origin_run_id=origin_run_id,
             namespace=resolve_identity(),
             username=get_username(),
-            metadata_str="%s@%s"
-            % (self.metadata.__class__.TYPE, self.metadata.__class__.INFO),
+            metadata_str=self.metadata.metadata_str(),
             is_running=True,
             tags=self.metadata.sticky_tags,
         )
@@ -546,9 +543,6 @@ class MetaflowTask(object):
             "project_flow_name": current.get("project_flow_name"),
             "trace_id": trace_id or None,
         }
-
-        _system_logger.update_context(task_payload)
-        _system_monitor.update_context(task_payload)
         start = time.time()
         self.metadata.start_task_heartbeat(self.flow.name, run_id, step_name, task_id)
         with self.monitor.measure("metaflow.task.duration"):
@@ -593,7 +587,8 @@ class MetaflowTask(object):
                         {
                             "parameter_names": self._init_parameters(
                                 inputs[0], passdown=True
-                            )
+                            ),
+                            "graph_info": self.flow._graph_info,
                         }
                     )
                 else:
@@ -617,7 +612,8 @@ class MetaflowTask(object):
                             {
                                 "parameter_names": self._init_parameters(
                                     inputs[0], passdown=False
-                                )
+                                ),
+                                "graph_info": self.flow._graph_info,
                             }
                         )
 
@@ -709,24 +705,34 @@ class MetaflowTask(object):
                         name="end",
                         payload={**task_payload, "msg": "Task ended"},
                     )
-
-                attempt_ok = str(bool(self.flow._task_ok))
-                self.metadata.register_metadata(
-                    run_id,
-                    step_name,
-                    task_id,
-                    [
-                        MetaDatum(
-                            field="attempt_ok",
-                            value=attempt_ok,
-                            type="internal_attempt_status",
-                            tags=["attempt_id:{0}".format(retry_count)],
-                        )
-                    ],
-                )
+                try:
+                    # persisting might fail due to unpicklable artifacts.
+                    output.persist(self.flow)
+                except Exception as ex:
+                    self.flow._task_ok = False
+                    raise ex
+                finally:
+                    # The attempt_ok metadata is used to determine task status so it is important
+                    # we ensure that it is written even in case of preceding failures.
+                    # f.ex. failing to serialize artifacts leads to a non-zero exit code for the process,
+                    # even if user code finishes successfully. Flow execution will not continue due to the exit,
+                    # so arguably we should mark the task as failed.
+                    attempt_ok = str(bool(self.flow._task_ok))
+                    self.metadata.register_metadata(
+                        run_id,
+                        step_name,
+                        task_id,
+                        [
+                            MetaDatum(
+                                field="attempt_ok",
+                                value=attempt_ok,
+                                type="internal_attempt_status",
+                                tags=["attempt_id:{0}".format(retry_count)],
+                            )
+                        ],
+                    )
 
                 output.save_metadata({"task_end": {}})
-                output.persist(self.flow)
 
                 # this writes a success marker indicating that the
                 # "transaction" is done
