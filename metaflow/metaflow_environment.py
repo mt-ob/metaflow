@@ -95,7 +95,7 @@ class MetaflowEnvironment(object):
             # NOTE: Reason for the extra conditionals in the script are because
             # Boto3 does not play well with passing None or an empty string to endpoint_url
             return "{python} -c '{script}'".format(
-                python=self._python(),
+                python="python3",
                 script='import boto3, os; ep=os.getenv(\\"METAFLOW_S3_ENDPOINT_URL\\"); boto3.client(\\"s3\\", **({\\"endpoint_url\\":ep} if ep else {})).download_file(\\"%s\\", \\"%s\\", \\"job.tar\\")'
                 % (bucket, s3_object),
             )
@@ -125,7 +125,7 @@ class MetaflowEnvironment(object):
             )
 
     def _get_install_dependencies_cmd(self, datastore_type):
-        base_cmd = "{} -m pip install -qqq".format(self._python())
+        base_cmd = "{} -m pip install -qqq".format("python3")
 
         datastore_packages = {
             "s3": ["boto3"],
@@ -213,4 +213,4 @@ class MetaflowEnvironment(object):
         if R.use_r():
             return "python3"
         else:
-            return "python"
+            return "python3"

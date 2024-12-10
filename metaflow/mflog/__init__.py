@@ -41,7 +41,7 @@ BASH_MFLOG = (
     " }" % TASK_LOG_SOURCE
 )
 
-BASH_SAVE_LOGS_ARGS = ["python", "-m", "metaflow.mflog.save_logs"]
+BASH_SAVE_LOGS_ARGS = ["python3", "-m", "metaflow.mflog.save_logs"]
 BASH_SAVE_LOGS = " ".join(BASH_SAVE_LOGS_ARGS)
 
 
@@ -51,7 +51,7 @@ def bash_capture_logs(bash_expr, var_transform=None):
     if var_transform is None:
         var_transform = lambda s: "$%s" % s
 
-    cmd = "python -m metaflow.mflog.tee %s %s"
+    cmd = "python3 -m metaflow.mflog.tee %s %s"
     parts = (
         bash_expr,
         cmd % (TASK_LOG_SOURCE, var_transform("MFLOG_STDOUT")),
