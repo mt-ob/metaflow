@@ -234,17 +234,50 @@ def check_split_join_balance(graph):
     )
 
     def traverse(node, split_stack):
+        """
+        Traverses the graph recursively to check for split-join balance,
+        correctly handling nested switch statements.
+        """
+
+        def _get_split_branch_for_node(node_name, split_node_name, graph):
+            """
+            Walks backwards from a node to find which branch of a given split
+            it belongs to. The branches are the direct children of the split node.
+            """
+            # The branches are the direct children of the split node
+            split_branches = set(graph[split_node_name].out_funcs)
+
+            # Use a queue for breadth-first search backwards
+            q = [node_name]
+            visited = {node_name}
+
+            while q:
+                current_name = q.pop(0)
+
+                # If we have reached one of the original branches, we are done
+                if current_name in split_branches:
+                    return current_name
+
+                # Add this node's parents to the queue to continue searching
+                for parent_name in graph[current_name].in_funcs:
+                    if parent_name not in visited:
+                        visited.add(parent_name)
+                        q.append(parent_name)
+            return None
+
         if node.type in ("start", "linear"):
             new_stack = split_stack
         elif node.type in ("split", "foreach"):
             new_stack = split_stack + [("split", node.out_funcs)]
         elif node.type == "split-switch":
+            # For a switch, continue traversal down each path with the same stack
             for n in node.out_funcs:
                 traverse(graph[n], split_stack)
             return
         elif node.type == "end":
             new_stack = split_stack
             if split_stack:
+                # If the stack is not empty at the 'end' step, a split was not joined.
                 _, split_roots = split_stack.pop()
                 roots = ", ".join(split_roots)
                 raise LintWarn(
@@ -255,7 +288,23 @@ def check_split_join_balance(graph):
             if split_stack:
                 _, split_roots = split_stack[-1]
                 new_stack = split_stack[:-1]
-                if len(node.in_funcs) != len(split_roots):
+
+                # --- Start of Modified Logic ---
+                # Identify the split this join corresponds to from its parentage.
+                split_node_name = node.split_parents[-1]
+
+                # Resolve each incoming function to its root branch from the split.
+                resolved_branches = set()
+                for in_node_name in node.in_funcs:
+                    branch = _get_split_branch_for_node(
+                        in_node_name, split_node_name, graph
+                    )
+                    if branch:
+                        resolved_branches.add(branch)
+
+                # The new validation compares the set of resolved branches
+                # against the expected branches from the split.
+                if len(resolved_branches) != len(split_roots):
                     paths = ", ".join(node.in_funcs)
                     roots = ", ".join(split_roots)
                     raise LintWarn(
@@ -265,11 +314,12 @@ def check_split_join_balance(graph):
                         node.func_lineno,
                         node.source_file,
                     )
+                # --- End of Modified Logic ---
             else:
+                # This join has no corresponding split.
                 raise LintWarn(msg2.format(node), node.func_lineno, node.source_file)
 
-            # check that incoming steps come from the same lineage
-            # (no cross joins)
+            # Check that incoming steps come from the same lineage (no cross joins).
             def parents(n):
                 if graph[n].type == "join":
                     return tuple(graph[n].split_parents[:-1])
@@ -281,9 +331,11 @@ def check_split_join_balance(graph):
         else:
             new_stack = split_stack
 
+        # Continue traversing to all children nodes.
         for n in node.out_funcs:
             traverse(graph[n], new_stack)
 
+    # The initial call to start the traversal from the 'start' node.
     traverse(graph["start"], [])
 
 

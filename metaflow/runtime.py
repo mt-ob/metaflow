@@ -668,6 +668,31 @@ class NativeRuntime(object):
     def _queue_pop(self):
         return self._run_queue.pop() if self._run_queue else (None, {})
 
+    def _get_split_branch_for_node(self, node_name, split_node_name):
+        """
+        Walks backwards from a node to find which branch of a given split
+        it belongs to. The branches are the direct children of the split_node.
+        """
+        split_branches = set(self._graph[split_node_name].out_funcs)
+
+        # Use a queue for breadth-first search backwards
+        q = [node_name]
+        visited = {node_name}
+
+        while q:
+            curr_name = q.pop(0)
+
+            # If we have reached one of the original branches, we are done
+            if curr_name in split_branches:
+                return curr_name
+
+            # Add this node's parents to the queue to continue searching
+            for parent_name in self._graph[curr_name].in_funcs:
+                if parent_name not in visited:
+                    visited.add(parent_name)
+                    q.append(parent_name)
+        return None
+
     def _queue_task_join(self, task, next_steps):
         # if the next step is a join, we need to check that
         # all input tasks for the join have finished before queuing it.
@@ -770,44 +795,79 @@ class NativeRuntime(object):
             # matching_split is the split-parent of the finished task
             matching_split = self._graph[self._graph[next_step].split_parents[-1]]
             _, foreach_stack = task.finished_id
-            index = ""
+
+            # This set of direct parents is used for all join types below.
+            direct_parents = set(self._graph[next_step].in_funcs)
+
             if matching_split.type == "foreach":
-                # next step is a foreach join
+                top_frame = task.finished_id[1][-1]
+                num_splits = top_frame.num_splits
 
-                def siblings(foreach_stack):
-                    top = foreach_stack[-1]
-                    bottom = list(foreach_stack[:-1])
-                    for index in range(top.num_splits):
-                        yield tuple(bottom + [top._replace(index=index)])
+                finished_for_each_index = {}
+                for finished_id, pathspec in self._finished.items():
+                    finished_step, finished_foreach_stack = finished_id
 
-                # required tasks are all split-siblings of the finished task
-                required_tasks = [
-                    self._finished.get((task.step, s)) for s in siblings(foreach_stack)
-                ]
-                join_type = "foreach"
-                index = self._translate_index(task, next_step, "join")
+                    if finished_step not in direct_parents:
+                        continue
+
+                    if (
+                        len(finished_foreach_stack) != len(task.finished_id[1])
+                        or finished_foreach_stack[:-1] != task.finished_id[1][:-1]
+                    ):
+                        continue
+
+                    current_index = finished_foreach_stack[-1].index
+                    finished_for_each_index[current_index] = pathspec
+
+                if (
+                    num_splits is not None
+                    and len(finished_for_each_index) == num_splits
+                ):
+                    required_tasks = list(finished_for_each_index.values())
+                    index = self._translate_index(task, next_step, "join")
+                    self._queue_push(
+                        next_step,
+                        {"input_paths": required_tasks, "join_type": "foreach"},
+                        index,
+                    )
             elif matching_split.type == "split-switch":
-                # next step is a switch split join
+                # This logic for a simple switch-join is correct and remains.
                 required_tasks = [task.path]
                 join_type = "split-switch"
                 index = self._translate_index(task, next_step, "linear")
-            else:
-                # next step is a split
-                # required tasks are all branches joined by the next step
-                required_tasks = [
-                    self._finished.get((step, foreach_stack))
-                    for step in self._graph[next_step].in_funcs
-                ]
-                join_type = "linear"
-                index = self._translate_index(task, next_step, "linear")
-
-            if all(required_tasks):
-                # all tasks to be joined are ready. Schedule the next join step.
                 self._queue_push(
                     next_step,
                     {"input_paths": required_tasks, "join_type": join_type},
                     index,
                 )
+            else:  # This handles generic 'split' joins, including your nested case.
+                split_node_name = matching_split.name
+                expected_branches = set(matching_split.out_funcs)
+
+                resolved_and_finished = {}
+                for finished_id, pathspec in self._finished.items():
+                    finished_step, finished_foreach_stack = finished_id
+
+                    if finished_step not in direct_parents:
+                        continue
+
+                    if finished_foreach_stack != foreach_stack:
+                        continue
+
+                    branch = self._get_split_branch_for_node(
+                        finished_step, split_node_name
+                    )
+                    if branch in expected_branches:
+                        resolved_and_finished[branch] = pathspec
+
+                if set(resolved_and_finished.keys()) == expected_branches:
+                    required_tasks = list(resolved_and_finished.values())
+                    index = self._translate_index(task, next_step, "linear")
+                    self._queue_push(
+                        next_step,
+                        {"input_paths": required_tasks, "join_type": "linear"},
+                        index,
+                    )
 
     def _queue_task_foreach(self, task, next_steps):
         # CHECK: this condition should be enforced by the linter but
