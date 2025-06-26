@@ -759,16 +759,24 @@ class FlowSpec(metaclass=FlowSpecMeta):
     def _validate_switch_cases(self, switch_cases, step):
         resolved_cases = {}
         for case_key, step_method in switch_cases.items():
-            if isinstance(case_key, str) and case_key.startswith("config."):
-                config_key = case_key[len("config") + 1 :]
-                try:
-                    resolved_key = str(getattr(self.config, config_key))
-                except AttributeError:
-                    msg = (
-                        "Step *{step}* references unknown config key '{key}' "
-                        "in switch case.".format(step=step, key=config_key)
+            if isinstance(case_key, str) and case_key.startswith("config:"):
+                full_path = case_key[len("config:") :]
+                parts = full_path.split(".", 1)
+                if len(parts) == 2:
+                    config_var_name, config_key_name = parts
+                    try:
+                        config_obj = getattr(self, config_var_name)
+                        resolved_key = str(getattr(config_obj, config_key_name))
+                    except AttributeError:
+                        msg = (
+                            "Step *{step}* references unknown config '{path}' "
+                            "in switch case.".format(step=step, path=full_path)
+                        )
+                        raise InvalidNextException(msg)
+                else:
+                    raise MetaflowInternalError(
+                        "Invalid config path format in switch case."
                     )
-                    raise InvalidNextException(msg)
             else:
                 resolved_key = case_key
 

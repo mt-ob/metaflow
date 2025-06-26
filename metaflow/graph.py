@@ -95,8 +95,10 @@ class DAGNode(object):
                         key.value.value, ast.Name
                     ):
                         # This handles self.config.some_key
-                        if key.value.value.id == "self" and key.value.attr == "config":
-                            case_key = f"config.{key.attr}"
+                        if key.value.value.id == "self":
+                            config_var = key.value.attr
+                            config_key = key.attr
+                            case_key = f"config:{config_var}.{config_key}"
                         else:
                             return None
                     else:
