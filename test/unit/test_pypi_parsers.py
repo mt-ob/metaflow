@@ -111,6 +111,6 @@ def test_requirements_parser():
 def test_toml_parser():
     result = pyproject_toml_parser(VALID_TOML)
 
-    assert result["python"] == ">=3.8"
+    assert result["python"] == "3.8.*"
     assert result["packages"]["dummypkg"] == "1.1.1"
     assert result["packages"]["anotherpkg"] == "0.0.1"
