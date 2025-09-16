@@ -1,5 +1,32 @@
 # this file can be overridden by extensions as is (e.g. metaflow-nflx-extensions)
 from metaflow.exception import MetaflowException
+from metaflow._vendor.packaging.specifiers import SpecifierSet
+
+
+def extract_python_version(version_spec: str) -> str:
+    """
+    Extract a concrete Python version for Metaflow compatibility.
+
+    Converts version specifiers like ">=3.8" to "3.8.*" so conda can find
+    available patch versions, while handling all comparison operators correctly.
+
+    Parameters
+    ----------
+    version_spec : str
+        A version specifier like ">=3.8", "==3.11", ">3.7", etc.
+
+    Returns
+    -------
+    str
+        A concrete version like "3.8.*" that conda can resolve.
+    """
+    if not version_spec or not version_spec.strip():
+        return "3.8.*"  # Safe default
+
+    candidates = ["3.6", "3.7", "3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+    spec_set = SpecifierSet(version_spec.strip())
+    matching = list(spec_set.filter(candidates))
+    return f"{matching[0]}.*" if matching else "3.8.*"
 
 
 class ParserValueError(MetaflowException):
@@ -81,7 +108,7 @@ def requirements_txt_parser(content: str):
                 raise ParserValueError(
                     f"Multiple Python version specs not allowed: '{line}'"
                 )
-            parsed["python"] = dep_spec or None
+            parsed["python"] = extract_python_version(dep_spec) if dep_spec else None
         else:
             parsed["packages"][dep_key] = dep_spec
 
@@ -142,7 +169,7 @@ def pyproject_toml_parser(content: str):
         # If present, store verbatim; note that PEP 621 does not necessarily
         # require "python" to be a dependency in the usual sense.
         # Example: "requires-python" = ">=3.7,<4"
-        parsed["python"] = requires_python.lstrip("=").strip()
+        parsed["python"] = extract_python_version(requires_python)
 
     for dep_line in requirements:
         dep_line_stripped = dep_line.strip()
@@ -171,7 +198,7 @@ def pyproject_toml_parser(content: str):
                 raise ParserValueError(
                     f"Multiple Python version specs not allowed: '{dep_line_stripped}'"
                 )
-            parsed["python"] = dep_spec or None
+            parsed["python"] = extract_python_version(dep_spec) if dep_spec else None
         else:
             parsed["packages"][dep_key] = dep_spec
 
