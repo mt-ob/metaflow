@@ -21,12 +21,12 @@ def extract_python_version(version_spec: str) -> str:
         A concrete version like "3.8.*" that conda can resolve.
     """
     if not version_spec or not version_spec.strip():
-        return "3.8.*"  # Safe default
+        return None
 
     candidates = ["3.6", "3.7", "3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
     spec_set = SpecifierSet(version_spec.strip())
     matching = list(spec_set.filter(candidates))
-    return f"{matching[0]}.*" if matching else "3.8.*"
+    return f"{matching[0]}.*" if matching else None
 
 
 class ParserValueError(MetaflowException):
