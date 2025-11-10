@@ -13,6 +13,7 @@ CLIS_DESC = [
     ("kubernetes", ".kubernetes.kubernetes_cli.cli"),
     ("step-functions", ".aws.step_functions.step_functions_cli.cli"),
     ("airflow", ".airflow.airflow_cli.cli"),
+    ("kfp", ".kfp.kfp_cli.cli"),
     ("argo-workflows", ".argo.argo_workflows_cli.cli"),
     ("card", ".cards.card_cli.cli"),
     ("tag", ".tag_cli.cli"),
@@ -53,6 +54,7 @@ STEP_DECORATORS_DESC = [
     ("card", ".cards.card_decorator.CardDecorator"),
     ("pytorch_parallel", ".frameworks.pytorch.PytorchParallelDecorator"),
     ("airflow_internal", ".airflow.airflow_decorator.AirflowInternalDecorator"),
+    ("kfp_internal", ".kfp.kfp_decorator.KFPInternalDecorator"),
     ("pypi", ".pypi.pypi_decorator.PyPIStepDecorator"),
     ("conda", ".pypi.conda_decorator.CondaStepDecorator"),
 ]

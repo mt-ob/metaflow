@@ -133,8 +133,8 @@ if "minio" in enabled_components:
     k8s_resource(
         'minio',
         port_forwards=[
-            '9000:9000',
-            '9001:9001'
+            '0.0.0.0:9000:9000',
+            '0.0.0.0:9001:9001'
         ],
         links=[
             link('http://localhost:9000', 'MinIO API'),
@@ -640,7 +640,7 @@ if "metadata-service" in enabled_components:
 
     k8s_resource(
         'metaflow-service',
-        port_forwards=['8080:8080'],
+        port_forwards=['0.0.0.0:8080:8080'],
         links=[link('http://localhost:8080/ping', 'Ping Metaflow Service')],
         labels=['metadata-service'],
         resource_deps=components['metadata-service']
