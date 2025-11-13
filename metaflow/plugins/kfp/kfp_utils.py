@@ -175,7 +175,7 @@ class KFPFlow(object):
         self._add_dependencies(task, node, seen)
         seen[node.name] = task
 
-        return task, seen
+        return task
 
     def _traverse_node(
         self,
@@ -194,40 +194,14 @@ class KFPFlow(object):
                 seen=seen,
             )
 
-        task, seen = self.create_and_connect(node, pipeline_kwargs, seen)
+        task = self.create_and_connect(node, pipeline_kwargs, seen)
 
         if node.type == "end":
             return task
 
         # 2. Handle traversal based on node type
         if node.type == "split":
-            # 2a. mark the join step, reserve it...
-            if node.matching_join and node.matching_join not in seen:
-                seen[node.matching_join] = None
-
-            # 2b. Recurse into all branches to start traversal down each path
-            for next_node_name in node.out_funcs:
-                self._traverse_node(
-                    node=self.graph[next_node_name],
-                    pipeline_kwargs=pipeline_kwargs,
-                    seen=seen,
-                )
-
-            # 2c. Create the join, replace the reservation
-            if (
-                node.matching_join
-                and node.matching_join in seen
-                and seen[node.matching_join] is None
-            ):
-                join_node = self.graph[node.matching_join]
-                _, seen = self.create_and_connect(join_node, pipeline_kwargs, seen)
-
-                if len(join_node.out_funcs) == 1:
-                    self._traverse_node(
-                        node=self.graph[join_node.out_funcs[0]],
-                        pipeline_kwargs=pipeline_kwargs,
-                        seen=seen,
-                    )
+            self._handle_split(node, pipeline_kwargs, seen)
 
         elif node.type in ["start", "linear", "join"] and len(node.out_funcs) == 1:
             # 2d. only one successor
@@ -264,3 +238,34 @@ class KFPFlow(object):
             if parent_name in seen and seen[parent_name] is not None:
                 parent = seen[parent_name]
                 task.after(parent)
+
+    def _handle_split(
+        self,
+        node,
+        pipeline_kwargs,
+        seen: Dict[str, dsl.PipelineTask],
+    ):
+        if node.matching_join and node.matching_join not in seen:
+            seen[node.matching_join] = None
+
+        for next_node_name in node.out_funcs:
+            self._traverse_node(
+                node=self.graph[next_node_name],
+                pipeline_kwargs=pipeline_kwargs,
+                seen=seen,
+            )
+
+        if (
+            node.matching_join
+            and node.matching_join in seen
+            and seen[node.matching_join] is None
+        ):
+            join_node = self.graph[node.matching_join]
+            _ = self.create_and_connect(join_node, pipeline_kwargs, seen)
+
+            if len(join_node.out_funcs) == 1:
+                self._traverse_node(
+                    node=self.graph[join_node.out_funcs[0]],
+                    pipeline_kwargs=pipeline_kwargs,
+                    seen=seen,
+                )
