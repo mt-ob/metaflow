@@ -186,7 +186,6 @@ class KFPFlow(object):
         if node.name in seen:
             return seen[node.name]
 
-        # 1. Ensure all parents are built..
         for parent_name in node.in_funcs:
             self._traverse_node(
                 node=self.graph[parent_name],
@@ -199,12 +198,10 @@ class KFPFlow(object):
         if node.type == "end":
             return task
 
-        # 2. Handle traversal based on node type
         if node.type == "split":
             self._handle_split(node, pipeline_kwargs, seen)
 
         elif node.type in ["start", "linear", "join"] and len(node.out_funcs) == 1:
-            # 2d. only one successor
             self._traverse_node(
                 node=self.graph[node.out_funcs[0]],
                 pipeline_kwargs=pipeline_kwargs,
