@@ -20,9 +20,13 @@ class KFPInternalDecorator(StepDecorator):
         ubf_context,
         inputs,
     ):
+        self.task_id = task_id
+        self.run_id = run_id
+        self.step_name = step_name
+        self.graph = graph
+
         meta = {}
-        # insert more if necessary
-        meta["kfp-template-owner"] = os.environ["METAFLOW_OWNER"]
+        meta["kfp-template-owner"] = os.environ.get("METAFLOW_OWNER", "unknown")
 
         entries = [
             MetaDatum(
@@ -32,3 +36,35 @@ class KFPInternalDecorator(StepDecorator):
         ]
 
         metadata.register_metadata(run_id, step_name, task_id, entries)
+
+    def task_finished(
+        self,
+        step_name,
+        flow,
+        graph,
+        is_task_ok,
+        retry_count,
+        max_user_code_retries,
+    ):
+        if not is_task_ok:
+            return
+
+        node = graph[step_name]
+
+        # Write task_id output (all steps except end and parallel_foreach)
+        if node.name != "end" and not node.parallel_foreach:
+            task_id_path = os.environ.get("KFP_OUTPUT_task_id_out")
+            if task_id_path:
+                with open(task_id_path, "w") as f:
+                    f.write(self.task_id)
+
+        # Handle foreach outputs
+        if node.type == "foreach":
+            cardinality = flow._foreach_num_splits
+
+            cardinality_path = os.environ.get("KFP_OUTPUT_split_cardinality")
+            if cardinality_path:
+                with open(cardinality_path, "w") as f:
+                    f.write(str(cardinality))  # Write as string, simpler than JSON
+
+        # TODO: Handle switch outputs later...

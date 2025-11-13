@@ -46,7 +46,6 @@ class KFPTask(object):
 
         sig = inspect.Signature(parameters)
 
-        # This inner function is what gets decorated
         def component_func(*args, **kwargs):
             return dsl.ContainerSpec(
                 image=self.image,
@@ -55,7 +54,6 @@ class KFPTask(object):
             )
 
         component_func.__name__ = self.name
-        # set __signature__ *before* decorating
         component_func.__signature__ = sig
 
         decorated = dsl.container_component(component_func)
@@ -77,14 +75,11 @@ class KFPTask(object):
                 field_path,
             )
 
-        # disable caching...
         task.set_caching_options(enable_caching=False)
 
-        # set env vars...
         for k, v in self.env_vars.items():
             task.set_env_variable(k, v)
 
-        # fill in k8s specific stuff...
         labels = self.k8s_resources.get("labels", None)
         if labels:
             for k, v in labels.items():
@@ -100,7 +95,6 @@ class KFPTask(object):
             requests = pod_resources.get("requests", {}).copy()
             limits = pod_resources.get("limits", {}).copy()
 
-            # no methods to set "ephemeral-storage" in requests and limits
             requests.pop("ephemeral-storage", None)
             limits.pop("ephemeral-storage", None)
 
@@ -113,8 +107,6 @@ class KFPTask(object):
             if "memory" in limits:
                 task.set_memory_limit(limits["memory"])
 
-            # After removing cpu, memory, ephemeral-storage,
-            # any remaining key should be a GPU resource
             gpu_resources = {
                 k: v
                 for k, v in limits.items()
@@ -122,7 +114,6 @@ class KFPTask(object):
             }
 
             if gpu_resources:
-                # Should only be one GPU type per task
                 if len(gpu_resources) > 1:
                     raise ValueError(
                         f"Multiple GPU types specified: {list(gpu_resources.keys())}. "
@@ -161,43 +152,115 @@ class KFPFlow(object):
             )
         pipeline_sig = inspect.Signature(pipeline_params)
 
-        # 2. Define the pipeline function
         def pipeline_func(*args, **kwargs):
-            # KFP populates kwargs from the signature
             pipeline_kwargs = pipeline_sig.bind(*args, **kwargs).arguments
+            self._build_pipeline(pipeline_kwargs)
 
-            seen = {}
-
-            for node_name in self.graph.sorted_nodes:
-                node = self.graph[node_name]
-                kfp_task = self.kfp_tasks[node_name]
-                input_values = {}
-
-                if node.name == "start":
-                    # Pass the pipeline parameters to the start step
-                    for param_name in self.parameters.keys():
-                        if param_name in pipeline_kwargs:
-                            input_values[param_name] = pipeline_kwargs[param_name]
-                else:
-                    # Wire parent task_id outputs to this step's inputs
-                    for parent_name in node.in_funcs:
-                        input_name = f"{parent_name}_task_id"
-                        if parent_name in seen:
-                            input_values[input_name] = seen[parent_name].outputs[
-                                "task_id_out"
-                            ]
-
-                task = kfp_task.create_task(**input_values)
-
-                if node.name != "start":
-                    for parent_name in node.in_funcs:
-                        if parent_name in seen:
-                            task.after(seen[parent_name])
-
-                seen[node_name] = task
-
-        # 3. Set the dynamic signature on the function
         pipeline_func.__signature__ = pipeline_sig
-
-        # 4. Decorate and return the pipeline function
         return dsl.pipeline(name=self.name)(pipeline_func)
+
+    def _build_pipeline(self, pipeline_kwargs):
+        if "start" in self.graph:
+            seen: Dict[str, dsl.PipelineTask] = {}
+            self._traverse_node(
+                node=self.graph["start"],
+                pipeline_kwargs=pipeline_kwargs,
+                seen=seen,
+            )
+
+    def create_and_connect(self, node, pipeline_kwargs, seen):
+        kfp_task_def = self.kfp_tasks[node.name]
+        input_values = self._prepare_node_inputs(node, pipeline_kwargs, seen)
+        task = kfp_task_def.create_task(**input_values)
+        self._add_dependencies(task, node, seen)
+        seen[node.name] = task
+
+        return task, seen
+
+    def _traverse_node(
+        self,
+        node,
+        pipeline_kwargs: Dict[str, Any],
+        seen: Dict[str, dsl.PipelineTask],
+    ) -> Optional[dsl.PipelineTask]:
+        if node.name in seen:
+            return seen[node.name]
+
+        # 1. Ensure all parents are built..
+        for parent_name in node.in_funcs:
+            self._traverse_node(
+                node=self.graph[parent_name],
+                pipeline_kwargs=pipeline_kwargs,
+                seen=seen,
+            )
+
+        task, seen = self.create_and_connect(node, pipeline_kwargs, seen)
+
+        if node.type == "end":
+            return task
+
+        # 2. Handle traversal based on node type
+        if node.type == "split":
+            # 2a. mark the join step, reserve it...
+            if node.matching_join and node.matching_join not in seen:
+                seen[node.matching_join] = None
+
+            # 2b. Recurse into all branches to start traversal down each path
+            for next_node_name in node.out_funcs:
+                self._traverse_node(
+                    node=self.graph[next_node_name],
+                    pipeline_kwargs=pipeline_kwargs,
+                    seen=seen,
+                )
+
+            # 2c. Create the join, replace the reservation
+            if (
+                node.matching_join
+                and node.matching_join in seen
+                and seen[node.matching_join] is None
+            ):
+                join_node = self.graph[node.matching_join]
+                _, seen = self.create_and_connect(join_node, pipeline_kwargs, seen)
+
+                if len(join_node.out_funcs) == 1:
+                    self._traverse_node(
+                        node=self.graph[join_node.out_funcs[0]],
+                        pipeline_kwargs=pipeline_kwargs,
+                        seen=seen,
+                    )
+
+        elif node.type in ["start", "linear", "join"] and len(node.out_funcs) == 1:
+            # 2d. only one successor
+            self._traverse_node(
+                node=self.graph[node.out_funcs[0]],
+                pipeline_kwargs=pipeline_kwargs,
+                seen=seen,
+            )
+
+        return task
+
+    def _prepare_node_inputs(self, node, pipeline_kwargs, seen):
+        input_values = {}
+        if node.name == "start":
+            for param_name in self.parameters.keys():
+                if param_name in pipeline_kwargs:
+                    # Pass flow parameters as inputs to the 'start' task
+                    input_values[param_name] = pipeline_kwargs[param_name]
+        else:
+            # Pass parent task outputs (like task_id_out) as inputs
+            for parent_name in node.in_funcs:
+                if parent_name in seen and seen[parent_name] is not None:
+                    parent_task = seen[parent_name]
+                    input_values[f"{parent_name}_task_id"] = parent_task.outputs.get(
+                        "task_id_out"
+                    )
+
+        return input_values
+
+    def _add_dependencies(
+        self, task: dsl.PipelineTask, node: Any, seen: Dict[str, dsl.PipelineTask]
+    ):
+        for parent_name in node.in_funcs:
+            if parent_name in seen and seen[parent_name] is not None:
+                parent = seen[parent_name]
+                task.after(parent)

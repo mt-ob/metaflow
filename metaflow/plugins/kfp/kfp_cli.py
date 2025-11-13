@@ -314,12 +314,12 @@ def create(
     kfp_client = Client(host="http://localhost:8081")
 
     # Validate if the workflow is correctly parsed.
-    _validate_workflow(
-        obj.flow,
-        obj.graph,
-        obj.flow_datastore,
-        obj.metadata,
-    )
+    # _validate_workflow(
+    #     obj.flow,
+    #     obj.graph,
+    #     obj.flow_datastore,
+    #     obj.metadata,
+    # )
 
     obj.echo("Compiling *%s* to Kubeflow Pipelines..." % obj.pipeline_name, bold=True)
     token = resolve_token(

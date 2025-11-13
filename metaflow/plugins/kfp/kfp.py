@@ -327,20 +327,59 @@ class KubeflowPipelines(object):
             "pod_resources": pod_resources,
         }
 
-    def create_kfp_task(self, node):
-        inputs = {}
-        outputs = {}
+    def get_inputs_and_outputs(self, node):
+        # TODO: handle conditionals, nested foreach and parallel later...
+        inputs, input_args = {}, []
+        outputs, output_args = {}, []
 
+        ## Handle Outputs
+        # All steps (except end & parallel) emit a task_id
+        if node.name != "end" and (not node.parallel_foreach):
+            outputs["task_id_out"] = str
+            output_args.append("{{$.outputs.parameters['task_id_out'].output_file}}")
+
+        # Foreach step emits the cardinality
+        if node.type == "foreach":
+            outputs["split_cardinality"] = int
+            output_args.append(
+                "{{$.outputs.parameters['split_cardinality'].output_file}}"
+            )
+
+        ## Handle Inputs
+        # Start step gets flow parameters as inputs
         if node.name == "start":
             for param_name, param_info in self.parameters.items():
                 inputs[param_name] = param_info["type"]
+                input_args.append(f"{{{{$.inputs.parameters['{param_name}']}}}}")
 
-        if node.name != "end":
-            outputs["task_id_out"] = str
-
+        # Iterate over parents of the node...
         for parent_name in node.in_funcs:
-            inputs[f"{parent_name}_task_id"] = str
+            parent_node = self.graph[parent_name]
 
+            # receive task ids of all parents...
+            inputs[f"{parent_name}_task_id"] = str
+            input_args.append(f"{{{{$.inputs.parameters['{parent_name}_task_id']}}}}")
+
+            if parent_node.type == "foreach":
+                # if this node is a child of foreach
+                # it will get parent's task id as well as
+                # the split index aka the iteration index
+                # to identify which instance it is
+                inputs[f"{parent_name}_split_index"] = int
+                input_args.append(
+                    f"{{{{$.inputs.parameters['{parent_name}_split_index']}}}}"
+                )
+
+        # this is a join node that corresponds to closing a foreach, and not a static split
+        # the cardinality will be used to build up the task ids of the foreach instances
+        if node.type == "join" and self.graph[node.split_parents[-1]].type == "foreach":
+            inputs["split_cardinality"] = int
+            input_args.append("{{$.inputs.parameters['split_cardinality']}}")
+
+        return inputs, input_args, outputs, output_args
+
+    def create_kfp_task(self, node):
+        inputs, input_args, outputs, output_args = self.get_inputs_and_outputs(node)
         resources = self._get_kubernetes_resources(node)
         env_vars = self._get_environment_variables(node)
 
@@ -356,69 +395,51 @@ class KubeflowPipelines(object):
         )
 
         command_str = self._step_cli(node, kfp_task_obj)
-        args = [command_str]
-
         if node.name == "start":
-            # Order: outputs, then params
-            args.extend([f"{{{{$.outputs.parameters['task_id_out'].output_file}}}}"])
-            args.extend(
-                [
-                    f"{{{{$.inputs.parameters['{p_name}']}}}}"
-                    for p_name in self.parameters
-                ]
-            )
+            args = [command_str] + output_args + input_args
         else:
-            # Order: parent_task_ids, then outputs (if any)
-            args.extend(
-                [
-                    f"{{{{$.inputs.parameters['{p_name}_task_id']}}}}"
-                    for p_name in node.in_funcs
-                ]
-            )
-            if node.name != "end":
-                args.extend(
-                    [f"{{{{$.outputs.parameters['task_id_out'].output_file}}}}"]
-                )
+            args = [command_str] + input_args + output_args
 
         kfp_task_obj.args = args
         return kfp_task_obj
 
-    def _step_cli(self, node, kfp_task):
+    def _step_cli(self, node, kfp_task: KFPTask):
         script_name = os.path.basename(sys.argv[0])
         executable = self.environment.executable(node.name)
         entrypoint = [executable, script_name]
 
         run_id = "kfp-{{workflow.name}}"
-        task_idx = ""
-        input_paths = ""
-        root_input = None
-
         task_id_base_parts = [
             node.name,
             "{{workflow.creationTimestamp}}",
-            root_input or input_paths,
-            task_idx,
         ]
 
-        if node.name == "start":
-            for i in range(len(self.parameters)):
-                task_id_base_parts.append(f"${i+1}")
-        else:
-            for i in range(len(node.in_funcs)):
-                task_id_base_parts.append(f"${i}")
+        # For non-start nodes, task ID depends on parent task IDs for uniqueness
+        if node.name != "start":
+            arg_index = 0
+            for parent_name in node.in_funcs:
+                parent_node = self.graph[parent_name]
 
-        # Task string to be hashed into an ID
+                # Add parent task ID to hash
+                task_id_base_parts.append(f"${arg_index}")
+                arg_index += 1
+
+                # If parent is foreach, also include split_index in hash
+                if parent_node.type == "foreach":
+                    task_id_base_parts.append(f"${arg_index}")
+                    arg_index += 1
+
+        # Generate task ID from hash of base parts
         task_str = "-".join(task_id_base_parts)
         _task_id_base = (
             "$(echo -n %s | md5sum | cut -d ' ' -f 1 | tail -c 9)" % task_str
         )
         task_str = "t-%s" % _task_id_base
-
         task_id_expr = "export METAFLOW_TASK_ID=%s" % task_str
         task_id = "$METAFLOW_TASK_ID"
 
+        # Get retry configuration
         user_code_retries, total_retries, _ = self._get_retries(node)
-
         retry_count = (
             (
                 "{{retries}}"
@@ -429,7 +450,7 @@ class KubeflowPipelines(object):
             else 0
         )
 
-        # Configure log capture.
+        # Configure log capture
         mflog_expr = export_mflog_env_vars(
             datastore_type=self.flow_datastore.TYPE,
             stdout_path="$PWD/.logs/mflog_stdout",
@@ -441,11 +462,9 @@ class KubeflowPipelines(object):
             retry_count=retry_count,
         )
 
+        # Initialize environment
         init_cmds = " && ".join(
             [
-                # For supporting sandboxes, ensure that a custom script is executed
-                # before anything else is executed. The script is passed in as an
-                # env var.
                 '${METAFLOW_INIT_SCRIPT:+eval \\"${METAFLOW_INIT_SCRIPT}\\"}',
                 "mkdir -p $PWD/.logs",
                 task_id_expr,
@@ -458,10 +477,12 @@ class KubeflowPipelines(object):
             )
         )
 
+        # Bootstrap commands for the step
         step_cmds = self.environment.bootstrap_commands(
             node.name, self.flow_datastore.TYPE
         )
 
+        # Build top-level CLI options
         top_opts_dict = {
             "with": [
                 decorator.make_decorator_spec()
@@ -470,14 +491,10 @@ class KubeflowPipelines(object):
             ]
         }
 
-        # FlowDecorators can define their own top-level options. They are
-        # responsible for adding their own top-level options and values through
-        # the get_top_level_options() hook. See similar logic in runtime.py.
         for deco in flow_decorators(self.flow):
             top_opts_dict.update(deco.get_top_level_options())
 
         top_opts = list(util.dict_to_cli_options(top_opts_dict))
-
         top_level = top_opts + [
             "--quiet",
             "--metadata=%s" % self.metadata.TYPE,
@@ -490,13 +507,19 @@ class KubeflowPipelines(object):
             "--with=kfp_internal",
         ]
 
+        # Build input paths
+        input_paths = ""
+        step_args_extra = []
+
         if node.name == "start":
-            # Execute `init` before any step of the workflow executes
+            # For start step, run init command to set up parameters
             task_id_params = "%s-params" % task_id
+
+            # Build parameter CLI args from input args
             param_cli_args = []
+            num_outputs = len(kfp_task.outputs)
             for i, p in enumerate(self.parameters.values()):
-                # $0 is output_file, $1 is first param, etc.
-                param_cli_args.append('--%s "$%d"' % (p["name"], i + 1))
+                param_cli_args.append('--%s "$%d"' % (p["name"], num_outputs + i))
 
             init = (
                 entrypoint
@@ -511,9 +534,8 @@ class KubeflowPipelines(object):
 
             if self.tags:
                 init.extend("--tag %s" % tag for tag in self.tags)
-            # if the start step gets retried, we must be careful
-            # not to regenerate multiple parameters tasks. Hence,
-            # we check first if _parameters exists already.
+
+            # Check if parameters already exist (for retries)
             exists = entrypoint + [
                 "dump",
                 "--max-value-size=0",
@@ -526,13 +548,46 @@ class KubeflowPipelines(object):
                     % (" ".join(exists), " ".join(init))
                 ]
             )
+
             input_paths = "%s/_parameters/%s" % (run_id, task_id_params)
         else:
+            # For non-start steps, build input paths from parent task IDs
             input_paths_parts = []
-            for i, parent_name in enumerate(node.in_funcs):
-                input_paths_parts.append(f"{run_id}/{parent_name}/${i}")
+            arg_index = 0
 
-            input_paths = ",".join(input_paths_parts)
+            for parent_name in node.in_funcs:
+                parent_node = self.graph[parent_name]
+
+                # Use arg_index for the actual argument position
+                input_paths_parts.append(f"{run_id}/{parent_name}/${arg_index}")
+                arg_index += 1
+
+                if parent_node.type == "foreach":
+                    step_args_extra.append(f"--split-index ${arg_index}")
+                    arg_index += 1  # split_index consumes another arg position
+
+            # Handle join after foreach
+            if (
+                node.type == "join"
+                and self.graph[node.split_parents[-1]].type == "foreach"
+            ):
+                foreach_step = next(
+                    n for n in node.in_funcs if self.graph[n].is_inside_foreach
+                )
+                # Get the base input_paths built so far
+                base_paths = ",".join(input_paths_parts) if input_paths_parts else ""
+                if not self.graph[node.split_parents[-1]].parallel_foreach:
+                    input_paths = (
+                        "$(python -m metaflow.plugins.argo.generate_input_paths %s {{workflow.creationTimestamp}} %s {{$.inputs.parameters['split_cardinality']}})"
+                        % (
+                            foreach_step,
+                            base_paths,  # Use base_paths, not undefined input_paths
+                        )
+                    )
+                else:
+                    input_paths = base_paths
+            else:
+                input_paths = ",".join(input_paths_parts) if input_paths_parts else ""
 
         # NOTE: input-paths might be extremely lengthy so we dump
         # these to diskinstead of passing them directly to the cmd
@@ -548,6 +603,8 @@ class KubeflowPipelines(object):
             "--input-paths-filename /tmp/mf-input-paths",
         ]
 
+        step.extend(step_args_extra)
+
         if self.tags:
             step.extend("--tag %s" % tag for tag in self.tags)
         if self.namespace is not None:
@@ -555,14 +612,22 @@ class KubeflowPipelines(object):
 
         step_cmds.extend([" ".join(entrypoint + top_level + step)])
 
-        final_cmds = ["c=$?", BASH_SAVE_LOGS]
-        if "task_id_out" in kfp_task.outputs:
+        # Export output file paths as environment variables
+        env_exports = []
+        output_arg_start = len(kfp_task.inputs)
+        for i, output_name in enumerate(kfp_task.outputs.keys()):
             if node.name == "start":
-                output_file_var = "$0"
+                env_exports.append(f"export KFP_OUTPUT_{output_name}=${i}")
             else:
-                output_file_var = f"${len(node.in_funcs)}"
-            final_cmds.append(f"echo -n {task_id} > {output_file_var}")
-        final_cmds.append("exit $c")
+                env_exports.append(
+                    f"export KFP_OUTPUT_{output_name}=${output_arg_start + i}"
+                )
+
+        if env_exports:
+            step_cmds.insert(-1, " && ".join(env_exports))
+
+        # Final commands for cleanup
+        final_cmds = ["c=$?", BASH_SAVE_LOGS, "exit $c"]
 
         cmd_str = "%s; %s" % (
             " && ".join([init_cmds, bash_capture_logs(" && ".join(step_cmds))]),
