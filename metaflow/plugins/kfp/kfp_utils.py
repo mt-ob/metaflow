@@ -219,10 +219,6 @@ class KFPFlow(object):
             self._handle_split(node, pipeline_kwargs, seen, loop_item_index)
 
         elif node.type == "foreach":
-            if node.is_inside_foreach:
-                raise NotSupportedException(
-                    "nested foreach are not supported as of now."
-                )
             self._handle_foreach(node, task, pipeline_kwargs, seen, loop_item_index)
 
         elif node.type in ["start", "linear", "join"] and len(node.out_funcs) == 1:
