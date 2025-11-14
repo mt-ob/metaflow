@@ -343,10 +343,6 @@ class KubeflowPipelines(object):
         if node.type == "foreach":
             outputs["splits_out"] = List[int]
             output_args.append("{{$.outputs.parameters['splits_out'].output_file}}")
-            outputs["split_cardinality"] = int
-            output_args.append(
-                "{{$.outputs.parameters['split_cardinality'].output_file}}"
-            )
 
         ## Handle Inputs
         # Start step gets flow parameters as inputs
@@ -379,10 +375,14 @@ class KubeflowPipelines(object):
                 input_args.append("{{$.inputs.parameters['split_index']}}")
 
         # this is a join node that corresponds to closing a foreach, and not a static split
-        # the cardinality will be used to build up the task ids of the foreach instances
+        # it gets task ids of all the parallel instances...
         if node_is_join_corresponding_to_foreach:
-            inputs["split_cardinality"] = int
-            input_args.append("{{$.inputs.parameters['split_cardinality']}}")
+            foreach_parent = self.graph[node.split_parents[-1]]
+            foreach_child = foreach_parent.out_funcs[0]
+            inputs[f"{foreach_child}_task_ids"] = List[str]
+            input_args.append(
+                f"{{{{$.inputs.parameters['{foreach_child}_task_ids']}}}}"
+            )
 
         return inputs, input_args, outputs, output_args
 
@@ -579,16 +579,15 @@ class KubeflowPipelines(object):
                 node.type == "join"
                 and self.graph[node.split_parents[-1]].type == "foreach"
             ):
-                foreach_step = next(
-                    n for n in node.in_funcs if self.graph[n].is_inside_foreach
-                )
+                foreach_parent = self.graph[node.split_parents[-1]]
+                foreach_child = foreach_parent.out_funcs[0]
                 # Get the base input_paths built so far
                 base_paths = ",".join(input_paths_parts) if input_paths_parts else ""
                 if not self.graph[node.split_parents[-1]].parallel_foreach:
                     input_paths = (
-                        "$(python -m metaflow.plugins.argo.generate_input_paths %s {{workflow.creationTimestamp}} %s {{$.inputs.parameters['split_cardinality']}})"
+                        f'$(python -m metaflow.plugins.kfp.generate_input_paths %s %s "$0")'
                         % (
-                            foreach_step,
+                            foreach_child,
                             base_paths,  # Use base_paths, not undefined input_paths
                         )
                     )

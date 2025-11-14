@@ -252,9 +252,6 @@ class KFPFlow(object):
         elif (
             node.type == "join" and self.graph[node.split_parents[-1]].type == "foreach"
         ):
-            # join for a corresponding foreach only expects cardinality so that
-            # it can build the input task ids deterministically using
-            # metaflow.plugins.argo.generate_input_paths
             pass
         else:
             # Pass parent task outputs (like task_id_out) as inputs
@@ -327,14 +324,18 @@ class KFPFlow(object):
         outer_loop_index: Optional[Any] = None,
     ):
         splits_out = task.outputs.get("splits_out")
-        cardinality = task.outputs.get("split_cardinality")
         loop_start_node_name = node.out_funcs[0]
 
         if node.matching_join and node.matching_join not in seen:
             seen[node.matching_join] = None
 
         with dsl.ParallelFor(
-            name=loop_start_node_name,
+            ## passing name leads to an error:
+            ### failed to resolve inputs: resolving input parameter with spec
+            ### task_output_parameter:{producer_task:"for-loop-1"
+            ### output_parameter_key:"pipelinechannel--a-component-task_id_out"}:
+            ### producer task, for-loop-1_544, not in tasks
+            # name=loop_start_node_name,
             items=splits_out,
             parallelism=None,
         ) as inner_loop_index:
@@ -347,10 +348,7 @@ class KFPFlow(object):
                 loop_item_index=inner_loop_index,
             )
 
-        # only need to wait for all parallel to finish...
-        # thus not storing the result i.e. not doing
-        # task_ids = dsl.Collected(...)
-        dsl.Collected(child_task.outputs.get("task_id_out"))
+        collected_task_ids = dsl.Collected(child_task.outputs.get("task_id_out"))
 
         if (
             node.matching_join
@@ -364,7 +362,7 @@ class KFPFlow(object):
                 pipeline_kwargs,
                 seen,
                 outer_loop_index,
-                {"split_cardinality": cardinality},
+                {f"{loop_start_node_name}_task_ids": collected_task_ids},
             )
 
             if len(join_node.out_funcs) == 1:
