@@ -4,6 +4,7 @@ import json
 import shlex
 import tempfile
 from io import BytesIO
+from typing import List
 from kfp import compiler
 from datetime import timedelta
 
@@ -340,6 +341,8 @@ class KubeflowPipelines(object):
 
         # Foreach step emits the cardinality
         if node.type == "foreach":
+            outputs["splits_out"] = List[int]
+            output_args.append("{{$.outputs.parameters['splits_out'].output_file}}")
             outputs["split_cardinality"] = int
             output_args.append(
                 "{{$.outputs.parameters['split_cardinality'].output_file}}"
@@ -352,27 +355,32 @@ class KubeflowPipelines(object):
                 inputs[param_name] = param_info["type"]
                 input_args.append(f"{{{{$.inputs.parameters['{param_name}']}}}}")
 
+        node_is_join_corresponding_to_foreach = (
+            node.type == "join" and self.graph[node.split_parents[-1]].type == "foreach"
+        )
+
         # Iterate over parents of the node...
         for parent_name in node.in_funcs:
             parent_node = self.graph[parent_name]
 
             # receive task ids of all parents...
-            inputs[f"{parent_name}_task_id"] = str
-            input_args.append(f"{{{{$.inputs.parameters['{parent_name}_task_id']}}}}")
+            if not node_is_join_corresponding_to_foreach:
+                inputs[f"{parent_name}_task_id"] = str
+                input_args.append(
+                    f"{{{{$.inputs.parameters['{parent_name}_task_id']}}}}"
+                )
 
             if parent_node.type == "foreach":
                 # if this node is a child of foreach
                 # it will get parent's task id as well as
                 # the split index aka the iteration index
                 # to identify which instance it is
-                inputs[f"{parent_name}_split_index"] = int
-                input_args.append(
-                    f"{{{{$.inputs.parameters['{parent_name}_split_index']}}}}"
-                )
+                inputs["split_index"] = int
+                input_args.append("{{$.inputs.parameters['split_index']}}")
 
         # this is a join node that corresponds to closing a foreach, and not a static split
         # the cardinality will be used to build up the task ids of the foreach instances
-        if node.type == "join" and self.graph[node.split_parents[-1]].type == "foreach":
+        if node_is_join_corresponding_to_foreach:
             inputs["split_cardinality"] = int
             input_args.append("{{$.inputs.parameters['split_cardinality']}}")
 

@@ -1,4 +1,5 @@
 import os
+import json
 from metaflow.decorators import StepDecorator
 from metaflow.metadata_provider import MetaDatum
 
@@ -61,10 +62,16 @@ class KFPInternalDecorator(StepDecorator):
         # Handle foreach outputs
         if node.type == "foreach":
             cardinality = flow._foreach_num_splits
+            splits = list(range(flow._foreach_num_splits))
 
             cardinality_path = os.environ.get("KFP_OUTPUT_split_cardinality")
             if cardinality_path:
                 with open(cardinality_path, "w") as f:
-                    f.write(str(cardinality))  # Write as string, simpler than JSON
+                    json.dump(cardinality, f)
+
+            splits_path = os.environ.get("KFP_OUTPUT_splits_out")
+            if splits_path:
+                with open(splits_path, "w") as f:
+                    json.dump(splits, f)
 
         # TODO: Handle switch outputs later...

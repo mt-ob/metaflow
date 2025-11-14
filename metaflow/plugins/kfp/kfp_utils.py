@@ -1,5 +1,6 @@
 import inspect
 from kfp import dsl, kubernetes
+from .exception import NotSupportedException
 from typing import List, Dict, Optional, Any
 
 
@@ -162,15 +163,26 @@ class KFPFlow(object):
     def _build_pipeline(self, pipeline_kwargs):
         if "start" in self.graph:
             seen: Dict[str, dsl.PipelineTask] = {}
+            loop_item_index = None
             self._traverse_node(
                 node=self.graph["start"],
                 pipeline_kwargs=pipeline_kwargs,
                 seen=seen,
+                loop_item_index=loop_item_index,
             )
 
-    def create_and_connect(self, node, pipeline_kwargs, seen):
+    def create_and_connect(
+        self,
+        node,
+        pipeline_kwargs,
+        seen,
+        loop_item_index=None,
+        extra_inputs: Optional[Dict] = None,
+    ):
         kfp_task_def = self.kfp_tasks[node.name]
-        input_values = self._prepare_node_inputs(node, pipeline_kwargs, seen)
+        input_values = self._prepare_node_inputs(
+            node, pipeline_kwargs, seen, loop_item_index, extra_inputs
+        )
         task = kfp_task_def.create_task(**input_values)
         self._add_dependencies(task, node, seen)
         seen[node.name] = task
@@ -182,6 +194,7 @@ class KFPFlow(object):
         node,
         pipeline_kwargs: Dict[str, Any],
         seen: Dict[str, dsl.PipelineTask],
+        loop_item_index: Optional[Any] = None,
     ) -> Optional[dsl.PipelineTask]:
         if node.name in seen:
             return seen[node.name]
@@ -191,32 +204,58 @@ class KFPFlow(object):
                 node=self.graph[parent_name],
                 pipeline_kwargs=pipeline_kwargs,
                 seen=seen,
+                loop_item_index=loop_item_index,
             )
 
-        task = self.create_and_connect(node, pipeline_kwargs, seen)
+        if node.type == "join" and node.name in seen and seen[node.name] is None:
+            task = None
+        else:
+            task = self.create_and_connect(node, pipeline_kwargs, seen, loop_item_index)
 
         if node.type == "end":
             return task
 
-        if node.type == "split":
-            self._handle_split(node, pipeline_kwargs, seen)
+        elif node.type == "split":
+            self._handle_split(node, pipeline_kwargs, seen, loop_item_index)
+
+        elif node.type == "foreach":
+            if node.is_inside_foreach:
+                raise NotSupportedException(
+                    "nested foreach are not supported as of now."
+                )
+            self._handle_foreach(node, task, pipeline_kwargs, seen, loop_item_index)
 
         elif node.type in ["start", "linear", "join"] and len(node.out_funcs) == 1:
             self._traverse_node(
                 node=self.graph[node.out_funcs[0]],
                 pipeline_kwargs=pipeline_kwargs,
                 seen=seen,
+                loop_item_index=loop_item_index,
             )
 
         return task
 
-    def _prepare_node_inputs(self, node, pipeline_kwargs, seen):
+    def _prepare_node_inputs(
+        self,
+        node,
+        pipeline_kwargs,
+        seen,
+        loop_item_index=None,
+        extra_inputs: Optional[Dict] = None,
+    ):
         input_values = {}
         if node.name == "start":
             for param_name in self.parameters.keys():
                 if param_name in pipeline_kwargs:
                     # Pass flow parameters as inputs to the 'start' task
                     input_values[param_name] = pipeline_kwargs[param_name]
+        elif (
+            node.type == "join" and self.graph[node.split_parents[-1]].type == "foreach"
+        ):
+            # join for a corresponding foreach only expects cardinality so that
+            # it can build the input task ids deterministically using
+            # metaflow.plugins.argo.generate_input_paths
+            pass
         else:
             # Pass parent task outputs (like task_id_out) as inputs
             for parent_name in node.in_funcs:
@@ -225,6 +264,13 @@ class KFPFlow(object):
                     input_values[f"{parent_name}_task_id"] = parent_task.outputs.get(
                         "task_id_out"
                     )
+
+        if loop_item_index is not None:
+            input_values["split_index"] = loop_item_index
+
+        if extra_inputs is not None:
+            for k, v in extra_inputs.items():
+                input_values[k] = v
 
         return input_values
 
@@ -241,6 +287,7 @@ class KFPFlow(object):
         node,
         pipeline_kwargs,
         seen: Dict[str, dsl.PipelineTask],
+        loop_item_index: Optional[Any] = None,
     ):
         if node.matching_join and node.matching_join not in seen:
             seen[node.matching_join] = None
@@ -250,6 +297,7 @@ class KFPFlow(object):
                 node=self.graph[next_node_name],
                 pipeline_kwargs=pipeline_kwargs,
                 seen=seen,
+                loop_item_index=loop_item_index,
             )
 
         if (
@@ -258,11 +306,71 @@ class KFPFlow(object):
             and seen[node.matching_join] is None
         ):
             join_node = self.graph[node.matching_join]
-            _ = self.create_and_connect(join_node, pipeline_kwargs, seen)
+            _ = self.create_and_connect(
+                join_node, pipeline_kwargs, seen, loop_item_index
+            )
 
             if len(join_node.out_funcs) == 1:
                 self._traverse_node(
                     node=self.graph[join_node.out_funcs[0]],
                     pipeline_kwargs=pipeline_kwargs,
                     seen=seen,
+                    loop_item_index=loop_item_index,
+                )
+
+    def _handle_foreach(
+        self,
+        node,
+        task,
+        pipeline_kwargs,
+        seen: Dict[str, dsl.PipelineTask],
+        outer_loop_index: Optional[Any] = None,
+    ):
+        splits_out = task.outputs.get("splits_out")
+        cardinality = task.outputs.get("split_cardinality")
+        loop_start_node_name = node.out_funcs[0]
+
+        if node.matching_join and node.matching_join not in seen:
+            seen[node.matching_join] = None
+
+        with dsl.ParallelFor(
+            name=loop_start_node_name,
+            items=splits_out,
+            parallelism=None,
+        ) as inner_loop_index:
+
+            child_node = self.graph[loop_start_node_name]
+            child_task = self._traverse_node(
+                node=child_node,
+                pipeline_kwargs=pipeline_kwargs,
+                seen=seen,
+                loop_item_index=inner_loop_index,
+            )
+
+        # only need to wait for all parallel to finish...
+        # thus not storing the result i.e. not doing
+        # task_ids = dsl.Collected(...)
+        dsl.Collected(child_task.outputs.get("task_id_out"))
+
+        if (
+            node.matching_join
+            and node.matching_join in seen
+            and seen[node.matching_join] is None
+        ):
+            join_node = self.graph[node.matching_join]
+
+            _ = self.create_and_connect(
+                join_node,
+                pipeline_kwargs,
+                seen,
+                outer_loop_index,
+                {"split_cardinality": cardinality},
+            )
+
+            if len(join_node.out_funcs) == 1:
+                self._traverse_node(
+                    node=self.graph[join_node.out_funcs[0]],
+                    pipeline_kwargs=pipeline_kwargs,
+                    seen=seen,
+                    loop_item_index=outer_loop_index,
                 )
