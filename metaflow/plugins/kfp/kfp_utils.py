@@ -262,7 +262,11 @@ class KFPFlow(object):
                         "task_id_out"
                     )
 
-        if loop_item_index is not None:
+        is_direct_child_of_foreach = any(
+            self.graph[parent_name].type == "foreach" for parent_name in node.in_funcs
+        )
+
+        if is_direct_child_of_foreach and loop_item_index is not None:
             input_values["split_index"] = loop_item_index
 
         if extra_inputs is not None:
@@ -348,21 +352,22 @@ class KFPFlow(object):
                 loop_item_index=inner_loop_index,
             )
 
-        collected_task_ids = dsl.Collected(child_task.outputs.get("task_id_out"))
+        join_node = self.graph[node.matching_join]
+        exit_step_name = join_node.in_funcs[0]
+        exit_step_task = seen[exit_step_name]
+        collected_task_ids = dsl.Collected(exit_step_task.outputs.get("task_id_out"))
 
         if (
             node.matching_join
             and node.matching_join in seen
             and seen[node.matching_join] is None
         ):
-            join_node = self.graph[node.matching_join]
-
             _ = self.create_and_connect(
                 join_node,
                 pipeline_kwargs,
                 seen,
                 outer_loop_index,
-                {f"{loop_start_node_name}_task_ids": collected_task_ids},
+                {f"{exit_step_name}_task_ids": collected_task_ids},
             )
 
             if len(join_node.out_funcs) == 1:
