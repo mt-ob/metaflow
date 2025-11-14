@@ -169,6 +169,8 @@ class KFPFlow(object):
                 pipeline_kwargs=pipeline_kwargs,
                 seen=seen,
                 loop_item_index=loop_item_index,
+                extra_inputs=None,
+                exit_node=None,
             )
 
     def create_and_connect(
@@ -185,7 +187,6 @@ class KFPFlow(object):
         )
         task = kfp_task_def.create_task(**input_values)
         self._add_dependencies(task, node, seen)
-        seen[node.name] = task
 
         return task
 
@@ -195,31 +196,41 @@ class KFPFlow(object):
         pipeline_kwargs: Dict[str, Any],
         seen: Dict[str, dsl.PipelineTask],
         loop_item_index: Optional[Any] = None,
+        extra_inputs: Optional[Dict] = None,
+        exit_node: Optional[str] = None,
     ) -> Optional[dsl.PipelineTask]:
         if node.name in seen:
+            if seen[node.name] is None:
+                # This catches cycles/recursion
+                raise NotSupportedException(
+                    f"Recursive step '{node.name}' is not supported."
+                )
             return seen[node.name]
 
-        for parent_name in node.in_funcs:
-            self._traverse_node(
-                node=self.graph[parent_name],
-                pipeline_kwargs=pipeline_kwargs,
-                seen=seen,
-                loop_item_index=loop_item_index,
-            )
+        if exit_node is not None and node.name == exit_node:
+            return
 
-        if node.type == "join" and node.name in seen and seen[node.name] is None:
-            task = None
-        else:
-            task = self.create_and_connect(node, pipeline_kwargs, seen, loop_item_index)
+        seen[node.name] = None
+
+        task = self.create_and_connect(
+            node, pipeline_kwargs, seen, loop_item_index, extra_inputs
+        )
+
+        seen[node.name] = task
 
         if node.type == "end":
             return task
 
+        elif node.type == "split-switch":
+            self._handle_switch(node, pipeline_kwargs, seen, loop_item_index, exit_node)
+
         elif node.type == "split":
-            self._handle_split(node, pipeline_kwargs, seen, loop_item_index)
+            self._handle_split(node, pipeline_kwargs, seen, loop_item_index, exit_node)
 
         elif node.type == "foreach":
-            self._handle_foreach(node, task, pipeline_kwargs, seen, loop_item_index)
+            self._handle_foreach(
+                node, task, pipeline_kwargs, seen, loop_item_index, exit_node
+            )
 
         elif node.type in ["start", "linear", "join"] and len(node.out_funcs) == 1:
             self._traverse_node(
@@ -227,6 +238,7 @@ class KFPFlow(object):
                 pipeline_kwargs=pipeline_kwargs,
                 seen=seen,
                 loop_item_index=loop_item_index,
+                exit_node=exit_node,
             )
 
         return task
@@ -285,9 +297,9 @@ class KFPFlow(object):
         pipeline_kwargs,
         seen: Dict[str, dsl.PipelineTask],
         loop_item_index: Optional[Any] = None,
+        exit_node: Optional[str] = None,
     ):
-        if node.matching_join and node.matching_join not in seen:
-            seen[node.matching_join] = None
+        join_node_name = node.matching_join
 
         for next_node_name in node.out_funcs:
             self._traverse_node(
@@ -295,25 +307,17 @@ class KFPFlow(object):
                 pipeline_kwargs=pipeline_kwargs,
                 seen=seen,
                 loop_item_index=loop_item_index,
+                exit_node=join_node_name,
             )
 
-        if (
-            node.matching_join
-            and node.matching_join in seen
-            and seen[node.matching_join] is None
-        ):
-            join_node = self.graph[node.matching_join]
-            _ = self.create_and_connect(
-                join_node, pipeline_kwargs, seen, loop_item_index
+        if join_node_name:
+            self._traverse_node(
+                node=self.graph[join_node_name],
+                pipeline_kwargs=pipeline_kwargs,
+                seen=seen,
+                loop_item_index=loop_item_index,
+                exit_node=exit_node,
             )
-
-            if len(join_node.out_funcs) == 1:
-                self._traverse_node(
-                    node=self.graph[join_node.out_funcs[0]],
-                    pipeline_kwargs=pipeline_kwargs,
-                    seen=seen,
-                    loop_item_index=loop_item_index,
-                )
 
     def _handle_foreach(
         self,
@@ -322,12 +326,13 @@ class KFPFlow(object):
         pipeline_kwargs,
         seen: Dict[str, dsl.PipelineTask],
         outer_loop_index: Optional[Any] = None,
+        exit_node: Optional[str] = None,
     ):
         splits_out = task.outputs.get("splits_out")
         loop_start_node_name = node.out_funcs[0]
 
-        if node.matching_join and node.matching_join not in seen:
-            seen[node.matching_join] = None
+        join_node_name = node.matching_join
+        join_node = self.graph[node.matching_join]
 
         with dsl.ParallelFor(
             ## passing name leads to an error:
@@ -341,35 +346,65 @@ class KFPFlow(object):
         ) as inner_loop_index:
 
             child_node = self.graph[loop_start_node_name]
-            child_task = self._traverse_node(
+            self._traverse_node(
                 node=child_node,
                 pipeline_kwargs=pipeline_kwargs,
                 seen=seen,
                 loop_item_index=inner_loop_index,
+                exit_node=join_node_name,
             )
 
-        join_node = self.graph[node.matching_join]
         exit_step_name = join_node.in_funcs[0]
         exit_step_task = seen[exit_step_name]
         collected_task_ids = dsl.Collected(exit_step_task.outputs.get("task_id_out"))
 
-        if (
-            node.matching_join
-            and node.matching_join in seen
-            and seen[node.matching_join] is None
-        ):
-            _ = self.create_and_connect(
+        if join_node_name:
+            self._traverse_node(
                 join_node,
                 pipeline_kwargs,
                 seen,
                 outer_loop_index,
-                {f"{exit_step_name}_task_ids": collected_task_ids},
+                extra_inputs={f"{exit_step_name}_task_ids": collected_task_ids},
+                exit_node=exit_node,
             )
 
-            if len(join_node.out_funcs) == 1:
-                self._traverse_node(
-                    node=self.graph[join_node.out_funcs[0]],
-                    pipeline_kwargs=pipeline_kwargs,
-                    seen=seen,
-                    loop_item_index=outer_loop_index,
+    def _handle_switch(
+        self,
+        node,
+        pipeline_kwargs,
+        seen: Dict[str, dsl.PipelineTask],
+        loop_item_index: Optional[Any] = None,
+        exit_node: Optional[str] = None,
+    ):
+        switch_task = seen[node.name]
+        chosen_branch = switch_task.outputs["switch_step_out"]
+
+        for i, branch_name in enumerate(node.out_funcs):
+            seen_for_branch = seen.copy()
+
+            branch_node = self.graph[branch_name]
+            if branch_node.name == node.name:
+                raise NotSupportedException(
+                    f"Recursive loops (step '{node.name}') are not supported in KFP."
                 )
+
+            if i == 0:
+                # First branch is dsl.If
+                with dsl.If(chosen_branch == branch_name):
+                    self._traverse_node(
+                        branch_node,
+                        pipeline_kwargs,
+                        seen_for_branch,
+                        loop_item_index,
+                        exit_node,
+                    )
+            else:
+                # Subsequent branches are dsl.Elif
+                with dsl.Elif(chosen_branch == branch_name):
+                    self._traverse_node(
+                        branch_node,
+                        pipeline_kwargs,
+                        seen_for_branch,
+                        loop_item_index,
+                        exit_node,
+                    )

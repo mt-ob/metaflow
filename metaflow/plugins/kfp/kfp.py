@@ -344,6 +344,13 @@ class KubeflowPipelines(object):
             outputs["splits_out"] = List[int]
             output_args.append("{{$.outputs.parameters['splits_out'].output_file}}")
 
+        # Switch step emits the chosen step
+        if node.type == "split-switch":
+            outputs["switch_step_out"] = str
+            output_args.append(
+                "{{$.outputs.parameters['switch_step_out'].output_file}}"
+            )
+
         ## Handle Inputs
         # Start step gets flow parameters as inputs
         if node.name == "start":

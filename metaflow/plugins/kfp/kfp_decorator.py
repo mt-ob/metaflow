@@ -68,4 +68,12 @@ class KFPInternalDecorator(StepDecorator):
                 with open(splits_path, "w") as f:
                     json.dump(splits, f)
 
-        # TODO: Handle switch outputs later...
+        # Handle switch step
+        if node.type == "split-switch":
+            _out_funcs, _ = flow._transition
+            chosen_step = _out_funcs[0]
+
+            switch_path = os.environ.get("KFP_OUTPUT_switch_step_out")
+            if switch_path:
+                with open(switch_path, "w") as f:
+                    f.write(chosen_step)
