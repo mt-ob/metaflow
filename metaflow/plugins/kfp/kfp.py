@@ -329,7 +329,7 @@ class KubeflowPipelines(object):
         }
 
     def get_inputs_and_outputs(self, node):
-        # TODO: handle conditionals, nested foreach and parallel later...
+        # TODO: handle conditionals and parallel later...
         inputs, input_args = {}, []
         outputs, output_args = {}, []
 
@@ -398,7 +398,7 @@ class KubeflowPipelines(object):
         env_vars = self._get_environment_variables(node)
 
         kfp_task_obj = KFPTask(
-            name="%s_component" % node.name,
+            name=node.name,
             image=resources["image"],
             command=["bash", "-c"],
             args=[],
@@ -602,7 +602,7 @@ class KubeflowPipelines(object):
                 input_paths = ",".join(input_paths_parts) if input_paths_parts else ""
 
         # NOTE: input-paths might be extremely lengthy so we dump
-        # these to diskinstead of passing them directly to the cmd
+        # these to disk instead of passing them directly to the cmd
         step_cmds.append("echo -n %s >> /tmp/mf-input-paths" % input_paths)
 
         step = [
