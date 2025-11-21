@@ -673,6 +673,7 @@ class KubeflowPipelines(object):
             self.graph,
             self.parameters,
             component_tasks,
+            self.max_workers,
         ).get_pipeline_func()
 
         with tempfile.NamedTemporaryFile(

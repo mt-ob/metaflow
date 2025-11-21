@@ -134,11 +134,13 @@ class KFPFlow(object):
         graph,
         parameters: Dict[str, dict],
         kfp_tasks: Dict[str, KFPTask],
+        max_workers=None,
     ):
         self.name = name
         self.graph = graph
         self.parameters = parameters
         self.kfp_tasks = kfp_tasks
+        self.max_workers = max_workers
 
     def get_pipeline_func(self) -> None:
         pipeline_params = []
@@ -342,7 +344,7 @@ class KFPFlow(object):
             ### producer task, for-loop-1_544, not in tasks
             # name=loop_start_node_name,
             items=splits_out,
-            parallelism=None,
+            parallelism=self.max_workers,
         ) as inner_loop_index:
 
             child_node = self.graph[loop_start_node_name]
